@@ -1,0 +1,1 @@
+{"name":"invoicedesk","version":"1.0.0","description":"Clients, invoices and payments for freelancers and small agencies","scripts":{"start":"node --no-warnings server.js","test":"node --no-warnings --test test/*.test.js"}}

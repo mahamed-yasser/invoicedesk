@@ -1,0 +1,68 @@
+'use strict';
+const http = require('node:http'), fs = require('node:fs'), path = require('node:path');
+const C = require('./core');
+const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css', '.js': 'text/javascript' };
+
+function createApp(db, { today = () => C.todayOf(db), loginLimit = 5 } = {}) {
+  const hits = new Map(); const limited = (ip, b, max) => { const k = b + ip, t = Date.now(); const a = (hits.get(k) || []).filter(x => t - x < 60000); a.push(t); hits.set(k, a); return a.length > max; };
+  const send = (res, code, body, type = 'application/json', extra = {}) => { res.writeHead(code, { 'Content-Type': type, 'X-Content-Type-Options': 'nosniff', ...extra }); res.end(type === 'application/json' ? JSON.stringify(body) : body); };
+  const readBody = req => new Promise((ok, bad) => { let s = ''; req.on('data', c => { s += c; if (s.length > 60000) { bad(new C.AppError('Body too large', 413)); req.destroy(); } }); req.on('end', () => { try { ok(s ? JSON.parse(s) : {}); } catch { bad(new C.AppError('Invalid JSON')); } }); });
+  const cookie = req => (/(?:^|; )sid=([a-f0-9]+)/.exec(req.headers.cookie || '') || [])[1];
+  const fails = new Map();
+  const view = i => ({ ...i });
+  return http.createServer(async (req, res) => {
+    const url = new URL(req.url, 'http://x'), p = url.pathname, m = req.method;
+    try {
+      if (p.startsWith('/api/')) {
+        if (m === 'GET' && p === '/api/setup-status') return send(res, 200, { needsSetup: C.needsSetup(db) });
+        if (m === 'POST' && p === '/api/setup') {
+          if (limited(req.socket.remoteAddress, 'setup', 10)) throw new C.AppError('Too many requests, wait a minute', 429);
+          const b = await readBody(req); if (!C.needsSetup(db)) throw new C.AppError('Setup already done', 409);
+          const u = String(b.username || '').trim(); if (!/^[A-Za-z0-9._-]{3,30}$/.test(u)) throw new C.AppError('Username: 3 to 30 letters, numbers or . _ -');
+          try { C.createUser(db, u, String(b.password || '')); } catch (e) { throw new C.AppError(e.message); }
+          const t = C.login(db, u, String(b.password)); return send(res, 201, { ok: true }, 'application/json', { 'Set-Cookie': `sid=${t}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800` });
+        }
+        if (m === 'POST' && p === '/api/login') {
+          const ip = req.socket.remoteAddress, f = fails.get(ip) || { n: 0, t: 0 };
+          if (f.n >= loginLimit && Date.now() - f.t < 60000) throw new C.AppError('Too many attempts, wait a minute', 429);
+          const b = await readBody(req), t = C.login(db, String(b.username || ''), String(b.password || ''));
+          if (!t) { fails.set(ip, { n: f.n + 1, t: Date.now() }); throw new C.AppError('Wrong username or password', 401); }
+          fails.delete(ip); return send(res, 200, { ok: true }, 'application/json', { 'Set-Cookie': `sid=${t}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800` });
+        }
+        if (m === 'POST' && p === '/api/logout') return send(res, 200, { ok: true }, 'application/json', { 'Set-Cookie': 'sid=; Max-Age=0; Path=/' });
+        if (!C.sessionUser(db, cookie(req))) throw new C.AppError('Login required', 401);
+        let mm;
+        if (m === 'GET' && p === '/api/me') return send(res, 200, { ok: true, today: today(), currency: C.setting(db, 'currency'), timezone: C.setting(db, 'tz') });
+        if (m === 'GET' && p === '/api/business') return send(res, 200, { business: C.getBusiness(db), currency: C.setting(db, 'currency'), timezone: C.setting(db, 'tz') });
+        if (m === 'POST' && p === '/api/business') { C.saveBusiness(db, await readBody(req)); return send(res, 200, { business: C.getBusiness(db) }); }
+        if (m === 'GET' && p === '/api/dashboard') return send(res, 200, C.dashboard(db, today()));
+        if (m === 'GET' && p === '/api/clients') return send(res, 200, { clients: db.prepare('SELECT * FROM clients ORDER BY name').all() });
+        if (m === 'POST' && p === '/api/clients') { const id = C.addClient(db, await readBody(req)); return send(res, 201, { id }); }
+        if (m === 'POST' && (mm = /^\/api\/clients\/(\d+)$/.exec(p))) { const b = await readBody(req); const name = String(b.name || '').trim().slice(0, 100); if (name.length < 2) throw new C.AppError('Client name is required'); if (!db.prepare('SELECT 1 FROM clients WHERE id=?').get(+mm[1])) throw new C.AppError('Client not found', 404); db.prepare('UPDATE clients SET name=?,email=?,address=? WHERE id=?').run(name, String(b.email || '').slice(0, 120) || null, String(b.address || '').slice(0, 200) || null, +mm[1]); return send(res, 200, { ok: true }); }
+        if (m === 'GET' && p === '/api/invoices') return send(res, 200, { invoices: C.listInvoices(db, today()).map(view) });
+        if (m === 'POST' && p === '/api/invoices') return send(res, 201, { invoice: C.createInvoice(db, await readBody(req)) });
+        if (m === 'GET' && p === '/api/export.csv') return send(res, 200, C.toCsv(C.listInvoices(db, today())), 'text/csv; charset=utf-8', { 'Content-Disposition': 'attachment; filename="invoices.csv"' });
+        if (m === 'GET' && (mm = /^\/api\/invoices\/(\d+)$/.exec(p))) { const i = C.getInvoice(db, mm[1], today()); if (!i) throw new C.AppError('Invoice not found', 404); return send(res, 200, { invoice: i }); }
+        if (m === 'POST' && (mm = /^\/api\/invoices\/(\d+)\/edit$/.exec(p))) return send(res, 200, { invoice: C.updateDraft(db, mm[1], await readBody(req)) });
+        if (m === 'GET' && (mm = /^\/api\/clients\/(\d+)\/statement$/.exec(p))) return send(res, 200, { statement: C.statement(db, mm[1], today()) });
+        if (m === 'POST' && (mm = /^\/api\/invoices\/(\d+)\/send$/.exec(p))) return send(res, 200, { invoice: C.send(db, mm[1]) });
+        if (m === 'POST' && (mm = /^\/api\/invoices\/(\d+)\/void$/.exec(p))) return send(res, 200, { invoice: C.voidInvoice(db, mm[1]) });
+        if (m === 'POST' && (mm = /^\/api\/invoices\/(\d+)\/payments$/.exec(p))) return send(res, 201, { invoice: C.recordPayment(db, mm[1], await readBody(req), today()) });
+        throw new C.AppError('Not found', 404);
+      }
+      if (m !== 'GET') throw new C.AppError('Not found', 404);
+      if (p === '/print' || p === '/statement') { if (!C.sessionUser(db, cookie(req))) { res.writeHead(302, { Location: '/' }); return res.end(); } }
+      const file = p === '/' ? '/index.html' : p === '/print' ? '/print.html' : p === '/statement' ? '/statement.html' : p;
+      const full = path.join(__dirname, 'public', path.normalize(file).replace(/^(\.\.[\/\\])+/, ''));
+      if (!full.startsWith(path.join(__dirname, 'public')) || !fs.existsSync(full) || fs.statSync(full).isDirectory()) throw new C.AppError('Not found', 404);
+      return send(res, 200, fs.readFileSync(full), MIME[path.extname(full)] || 'application/octet-stream');
+    } catch (e) { if (e instanceof C.AppError) return send(res, e.status, { error: e.message }); console.error(e); return send(res, 500, { error: 'Server error' }); }
+  });
+}
+module.exports = { createApp };
+if (require.main === module) {
+  const db = C.open(process.env.DB || 'invoices.db');
+  if (process.env.SEED_DEMO === '1' && !db.prepare('SELECT 1 FROM clients').get()) require('./seed').seed(db);
+  const host = process.env.HOST || '127.0.0.1', port = +process.env.PORT || 3100;
+  createApp(db).listen(port, host, () => { console.log(`InvoiceDesk on http://${host}:${port} (local only unless HOST is set)`); if (C.needsSetup(db)) console.log('No account yet: open the page to create one.'); });
+}
