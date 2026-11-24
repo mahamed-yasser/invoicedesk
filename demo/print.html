@@ -1,0 +1,19 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Invoice</title>
+<style>body{font:15px/1.5 system-ui,sans-serif;color:#111;max-width:760px;margin:30px auto;padding:0 20px}h1{margin:0}table{width:100%;border-collapse:collapse;margin:24px 0}th,td{padding:8px;border-bottom:1px solid #ddd;text-align:left}th.n,td.n{text-align:right}.tot{margin-left:auto;width:260px}.tot div{display:flex;justify-content:space-between;padding:3px 0}.g{font-weight:700;border-top:2px solid #111;margin-top:4px;padding-top:6px}.top{display:flex;justify-content:space-between;align-items:flex-start;gap:20px}.mut{color:#555}.st{display:inline-block;border:2px solid #111;padding:2px 12px;font-weight:700;text-transform:uppercase;letter-spacing:.1em}button{padding:8px 16px;margin-bottom:16px}@media print{button{display:none}body{margin:0}}</style><style>
+#demo-banner{background:#fff7d6;color:#3b2f00;border-bottom:1px solid #e6cf7a;padding:8px 14px;font:13px/1.4 system-ui,sans-serif;display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+#demo-banner button{font:inherit;padding:3px 10px;border:1px solid #b99a1c;background:#fff;color:#3b2f00;border-radius:6px;cursor:pointer}
+#demo-banner a{color:#5a4600}
+#out{display:none!important}
+@media(max-width:640px){#demo-banner{padding:5px 10px;font-size:12px;gap:8px}#demo-banner .long{display:none}#demo-banner button{padding:2px 8px}
+header{padding:4px 14px!important}header nav{flex-wrap:nowrap!important;overflow-x:auto;white-space:nowrap}header nav button{flex:0 0 auto;padding:8px 10px!important}}</style><script src="sql-wasm.js"></script><script src="demo-config.js"></script><script src="runtime.js"></script></head><body>
+<button onclick="print()">Print or save as PDF</button><div id="o">Loading...</div>
+<script>
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+(async()=>{const id=new URLSearchParams(location.search).get('id');const [me,r,bz]=await Promise.all([fetch('/api/me').then(r=>r.json()),fetch('/api/invoices/'+encodeURIComponent(id)).then(r=>r.json()),fetch('/api/business').then(r=>r.json())]);const b=bz.business;
+if(!r.invoice){document.getElementById('o').textContent=r.error||'Not found';return}const i=r.invoice,M=c=>new Intl.NumberFormat('en',{style:'currency',currency:me.currency}).format(c/100);
+document.getElementById('o').innerHTML=`<div class="top"><div><h1>INVOICE</h1><div class="mut">${i.number}</div><p><b>${esc(b.business_name)||'(Set your business name in Settings)'}</b><br>${esc(b.business_address)}${b.business_address?'<br>':''}${esc(b.business_email)}${b.business_tax_id?'<br>Tax/registration no: '+esc(b.business_tax_id):''}</p></div><div style="text-align:right"><span class="st">${i.status}</span><div class="mut">Issued ${i.issue_date}<br>Due ${i.due_date}</div></div></div>
+<p><b>Bill to</b><br>${esc(i.client_name)}<br>${esc(i.client_address||'')}<br>${esc(i.client_email||'')}</p>
+<table><thead><tr><th>Description</th><th class="n">Qty</th><th class="n">Unit price</th><th class="n">Amount (${me.currency})</th></tr></thead><tbody>${i.items.map(t=>`<tr><td>${esc(t.description)}</td><td class="n">${t.qty_milli/1000}</td><td class="n">${M(t.unit_cents)}</td><td class="n">${M(Math.round(t.qty_milli*t.unit_cents/1000))}</td></tr>`).join('')}</tbody></table>
+<div class="tot"><div><span>Subtotal</span><span>${M(i.subtotal)}</span></div><div><span>Tax (${i.tax_bp/100}%)</span><span>${M(i.tax)}</span></div><div><span>Total</span><span>${M(i.total)}</span></div><div><span>Paid</span><span>${M(i.paid)}</span></div><div class="g"><span>Balance due (${me.currency})</span><span>${M(i.balance)}</span></div></div>${i.notes?`<p class="mut">${esc(i.notes)}</p>`:''}`;
+document.title=i.number})();
+</script></body></html>

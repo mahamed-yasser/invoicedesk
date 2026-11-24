@@ -31,3 +31,9 @@ Money is stored as integer cents, so totals do not drift. Overdue and "today" fo
 
 ## Limits
 Not security-reviewed; serve over HTTPS before real use (session cookie is not marked Secure). One user role, no password reset, no email sending, no online payment, no credit notes, no multi-currency (one currency per database), sent invoices cannot be edited (void and re-issue; drafts can be edited), paid invoices cannot be voided. Rate limits are in memory per process. No PDF generation on the server; the print view uses the browser.
+
+## Browser demo
+`demo/` is a browser-only demo build: it runs this app's own `core.js` and `server.js` request handler inside the page, with SQLite compiled to WebAssembly ([sql.js](https://github.com/sql-js/sql.js)). Nothing is sent to a server. Each visitor gets their own fictional data, stored in that browser's localStorage, with a "Reset demo data" button. The demo signs in automatically with a built-in demo user and uses a stand-in for password hashing, so it is not a model of the real app's login. Serve the `demo/` folder from any static host. Rebuild it with `node tools/demo-build/build.js` (see the header of that file for arguments).
+
+## Hosting for real use
+Serve it behind HTTPS and set `COOKIE_SECURE=1` so the session cookie is marked Secure. Responses send `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`. Do not expose a fresh database to the internet: the first visitor to open the setup page becomes the owner.

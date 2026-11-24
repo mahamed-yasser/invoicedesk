@@ -1,0 +1,19 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Statement</title>
+<style>body{font:15px/1.5 system-ui,sans-serif;color:#111;max-width:760px;margin:30px auto;padding:0 20px}h1{margin:0}table{width:100%;border-collapse:collapse;margin:20px 0}th,td{padding:8px;border-bottom:1px solid #ddd;text-align:left}th.n,td.n{text-align:right}.tot{margin-left:auto;width:300px}.tot div{display:flex;justify-content:space-between;padding:3px 0}.g{font-weight:700;border-top:2px solid #111;margin-top:4px;padding-top:6px}.top{display:flex;justify-content:space-between;align-items:flex-start;gap:20px}.mut{color:#555}.late{color:#b42318;font-weight:600}button{padding:8px 16px;margin-bottom:16px}@media print{button{display:none}body{margin:0}}</style><style>
+#demo-banner{background:#fff7d6;color:#3b2f00;border-bottom:1px solid #e6cf7a;padding:8px 14px;font:13px/1.4 system-ui,sans-serif;display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+#demo-banner button{font:inherit;padding:3px 10px;border:1px solid #b99a1c;background:#fff;color:#3b2f00;border-radius:6px;cursor:pointer}
+#demo-banner a{color:#5a4600}
+#out{display:none!important}
+@media(max-width:640px){#demo-banner{padding:5px 10px;font-size:12px;gap:8px}#demo-banner .long{display:none}#demo-banner button{padding:2px 8px}
+header{padding:4px 14px!important}header nav{flex-wrap:nowrap!important;overflow-x:auto;white-space:nowrap}header nav button{flex:0 0 auto;padding:8px 10px!important}}</style><script src="sql-wasm.js"></script><script src="demo-config.js"></script><script src="runtime.js"></script></head><body>
+<button onclick="print()">Print or save as PDF</button><div id="o">Loading...</div>
+<script>
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+(async()=>{const id=new URLSearchParams(location.search).get('id');const [r,bz]=await Promise.all([fetch('/api/clients/'+encodeURIComponent(id)+'/statement').then(r=>r.json()),fetch('/api/business').then(r=>r.json())]);const b=bz.business;
+if(!r.statement){document.getElementById('o').textContent=r.error||'Not found';return}const s=r.statement,M=c=>new Intl.NumberFormat('en',{style:'currency',currency:s.currency}).format(c/100);
+const lab={current:'Not yet due',d1_30:'1 to 30 days late',d31_60:'31 to 60 days late',d60plus:'Over 60 days late'};
+document.getElementById('o').innerHTML=`<div class="top"><div><h1>STATEMENT</h1><div class="mut">As of ${s.asOf}</div><p><b>${esc(b.business_name)||'(Set your business name in Settings)'}</b><br>${esc(b.business_address)}${b.business_address?'<br>':''}${esc(b.business_email)}</p></div><div style="text-align:right"><b>${esc(s.client.name)}</b><br>${esc(s.client.address||'')}<br>${esc(s.client.email||'')}</div></div>
+<table><thead><tr><th>Invoice</th><th>Issued</th><th>Due</th><th>Status</th><th class="n">Total</th><th class="n">Paid</th><th class="n">Balance</th></tr></thead><tbody>${s.invoices.map(i=>`<tr><td>${i.number}</td><td>${i.issue_date}</td><td>${i.due_date}</td><td class="${i.status==='overdue'?'late':''}">${i.status}</td><td class="n">${M(i.total)}</td><td class="n">${M(i.paid)}</td><td class="n">${M(i.balance)}</td></tr>`).join('')||'<tr><td colspan="7" class="mut">No sent invoices.</td></tr>'}</tbody></table>
+<div class="tot"><div><span>Total invoiced</span><span>${M(s.totalInvoiced)}</span></div><div><span>Total paid</span><span>${M(s.totalPaid)}</span></div><div class="g"><span>Amount due (${s.currency})</span><span>${M(s.totalDue)}</span></div></div>
+<p class="mut" style="margin-top:20px">${Object.keys(s.aging).filter(k=>s.aging[k]).map(k=>lab[k]+': '+M(s.aging[k])).join(' · ')}</p>`;document.title='Statement '+s.client.name})();
+</script></body></html>
