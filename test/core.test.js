@@ -183,3 +183,51 @@ test('client statement lists sent invoices only, with correct due and aging', ()
   assert.strictEqual(s.aging.d1_30, 10000); assert.strictEqual(s.aging.current, 6000);
   assert.throws(() => C.statement(db, 99, TODAY), e => e.status === 404);
 });
+
+// ---- listInvoices / statement: equivalence with getInvoice, filtering across clients ----
+function busy() {
+  const db = C.open(); db.prepare("UPDATE settings SET value='UTC' WHERE key='tz'").run();
+  for (const n of ['A Co', 'B Co', 'C Co']) C.addClient(db, { name: n });
+  let k = 0;
+  for (let i = 0; i < 40; i++) {
+    const inv = mk(db, { clientId: 1 + (i % 2), issueDate: `2026-${String(1 + (i % 9)).padStart(2, '0')}-10`, dueDate: `2026-${String(1 + (i % 9)).padStart(2, '0')}-24`, items: [{ description: 'a', qty: 1 + (i % 3), unitPrice: 50 + i }, { description: 'b', qty: 1, unitPrice: 20 }] });
+    if (i % 5 === 0) continue;                                     // draft
+    C.send(db, inv.id);
+    if (i % 7 === 0) C.voidInvoice(db, inv.id);
+    else if (i % 3 === 0) { C.recordPayment(db, inv.id, { amount: 10, paidOn: '2026-11-01' }, TODAY); C.recordPayment(db, inv.id, { amount: 5, paidOn: '2026-10-01' }, TODAY); k++; }
+    else if (i % 4 === 0) C.recordPayment(db, inv.id, { amount: inv.total / 100, paidOn: TODAY }, TODAY); // fully paid
+  }
+  return db;
+}
+test('listInvoices returns exactly what getInvoice returns for each invoice, in the same order', () => {
+  const db = busy(); const ids = db.prepare('SELECT id FROM invoices ORDER BY issue_date DESC, id DESC').all().map(r => r.id);
+  const list = C.listInvoices(db, TODAY);
+  assert.strictEqual(list.length, 40);
+  assert.deepStrictEqual(list.map(i => i.id), ids);
+  assert.deepStrictEqual(list, ids.map(id => C.getInvoice(db, id, TODAY)));
+  assert.ok(list.some(i => i.payments.length === 2) && list.some(i => i.status === 'paid') && list.some(i => i.status === 'void') && list.some(i => i.status === 'draft'));
+});
+test('listInvoices with a client id equals the all-invoices list filtered to that client', () => {
+  const db = busy(); const all = C.listInvoices(db, TODAY);
+  for (const c of [1, 2]) assert.deepStrictEqual(C.listInvoices(db, TODAY, c), all.filter(i => i.client_id === c));
+  assert.deepStrictEqual(C.listInvoices(db, TODAY, 3), []);
+});
+test('statement only includes the requested client, and an empty client gives zero totals', () => {
+  const db = busy();
+  for (const c of [1, 2]) {
+    const s = C.statement(db, c, TODAY), want = C.listInvoices(db, TODAY).filter(i => i.client_id === c && i.state === 'sent');
+    assert.deepStrictEqual(s.invoices.map(i => i.id), want.map(i => i.id));
+    assert.strictEqual(s.totalInvoiced, want.reduce((a, i) => a + i.total, 0)); assert.strictEqual(s.totalPaid, want.reduce((a, i) => a + i.paid, 0)); assert.strictEqual(s.totalDue, want.reduce((a, i) => a + i.balance, 0));
+    assert.ok(s.invoices.every(i => want.find(w => w.id === i.id)));
+  }
+  const e = C.statement(db, 3, TODAY);
+  assert.deepStrictEqual(e.invoices, []); assert.strictEqual(e.totalInvoiced, 0); assert.strictEqual(e.totalDue, 0); assert.deepStrictEqual(e.aging, { current: 0, d1_30: 0, d31_60: 0, d60plus: 0 });
+});
+test('dashboard figures match an independent recomputation from getInvoice', () => {
+  const db = busy(); const d = C.dashboard(db, TODAY);
+  const live = db.prepare('SELECT id FROM invoices').all().map(r => C.getInvoice(db, r.id, TODAY)).filter(i => i.state === 'sent');
+  assert.strictEqual(d.outstanding, live.reduce((a, i) => a + i.balance, 0));
+  assert.strictEqual(d.overdue, live.filter(i => i.status === 'overdue').reduce((a, i) => a + i.balance, 0));
+  assert.strictEqual(d.overdueCount, live.filter(i => i.status === 'overdue').length);
+  assert.strictEqual(d.aging.current + d.aging.d1_30 + d.aging.d31_60 + d.aging.d60plus, d.outstanding);
+});
