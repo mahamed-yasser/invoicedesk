@@ -93,18 +93,30 @@ function status(inv, paid, today) {
   if (inv.due_date < today) return 'overdue';
   return paid > 0 ? 'partial' : 'sent';
 }
-function getInvoice(db, id, today = new Date().toISOString().slice(0, 10)) {
-  const inv = db.prepare('SELECT i.*, c.name client_name, c.email client_email, c.address client_address FROM invoices i JOIN clients c ON c.id=i.client_id WHERE i.id=?').get(+id);
-  if (!inv) return null;
-  inv.items = db.prepare('SELECT * FROM items WHERE invoice_id=? ORDER BY id').all(inv.id);
-  inv.payments = db.prepare('SELECT * FROM payments WHERE invoice_id=? ORDER BY paid_on,id').all(inv.id);
+const INV_SELECT = 'SELECT i.*, c.name client_name, c.email client_email, c.address client_address FROM invoices i JOIN clients c ON c.id=i.client_id';
+// Adds items, payments, totals, balance and status to an invoice row. Shared by getInvoice and listInvoices.
+function assemble(inv, items, payments, today) {
+  inv.items = items; inv.payments = payments;
   Object.assign(inv, totals(inv.items, inv.tax_bp));
   inv.paid = inv.payments.reduce((s, p) => s + p.amount_cents, 0);
   inv.balance = inv.state === 'void' ? 0 : Math.max(0, inv.total - inv.paid);
   inv.status = status(inv, inv.paid, today);
   return inv;
 }
-function listInvoices(db, today) { return db.prepare('SELECT id FROM invoices ORDER BY issue_date DESC, id DESC').all().map(r => getInvoice(db, r.id, today)); }
+function getInvoice(db, id, today = new Date().toISOString().slice(0, 10)) {
+  const inv = db.prepare(INV_SELECT + ' WHERE i.id=?').get(+id);
+  if (!inv) return null;
+  return assemble(inv, db.prepare('SELECT * FROM items WHERE invoice_id=? ORDER BY id').all(inv.id), db.prepare('SELECT * FROM payments WHERE invoice_id=? ORDER BY paid_on,id').all(inv.id), today);
+}
+// Three queries in total (invoices, items, payments), not three per invoice. Same result and order as calling getInvoice for each id.
+function listInvoices(db, today, clientId) {
+  const where = clientId == null ? '' : ' WHERE i.client_id=?', args = clientId == null ? [] : [+clientId];
+  const rows = db.prepare(INV_SELECT + where + ' ORDER BY i.issue_date DESC, i.id DESC').all(...args);
+  const group = sql => { const m = new Map(); for (const r of db.prepare(sql).all(...args)) { if (!m.has(r.invoice_id)) m.set(r.invoice_id, []); m.get(r.invoice_id).push(r); } return m; };
+  const scope = clientId == null ? '' : ' WHERE invoice_id IN (SELECT id FROM invoices WHERE client_id=?)';
+  const items = group('SELECT * FROM items' + scope + ' ORDER BY id'), pays = group('SELECT * FROM payments' + scope + ' ORDER BY paid_on, id');
+  return rows.map(r => assemble(r, items.get(r.id) || [], pays.get(r.id) || [], today));
+}
 function send(db, id) {
   const inv = getInvoice(db, id); if (!inv) throw new AppError('Invoice not found', 404);
   if (inv.state !== 'draft') throw new AppError('Only drafts can be sent', 409);
@@ -144,7 +156,7 @@ function dashboard(db, today) {
 // Statement of account for one client: every sent invoice with what is still owed, plus age buckets.
 function statement(db, clientId, today) {
   const client = db.prepare('SELECT * FROM clients WHERE id=?').get(+clientId); if (!client) throw new AppError('Client not found', 404);
-  const invs = listInvoices(db, today).filter(i => i.client_id === client.id && i.state === 'sent');
+  const invs = listInvoices(db, today, client.id).filter(i => i.state === 'sent');
   const aging = { current: 0, d1_30: 0, d31_60: 0, d60plus: 0 };
   for (const i of invs) { if (i.balance <= 0) continue; const late = Math.floor((Date.parse(today) - Date.parse(i.due_date)) / 864e5); aging[late <= 0 ? 'current' : late <= 30 ? 'd1_30' : late <= 60 ? 'd31_60' : 'd60plus'] += i.balance; }
   return { client, asOf: today, currency: setting(db, 'currency'), invoices: invs.map(i => ({ id: i.id, number: i.number, issue_date: i.issue_date, due_date: i.due_date, status: i.status, total: i.total, paid: i.paid, balance: i.balance })),
@@ -160,8 +172,12 @@ function createUser(db, u, pw, role = 'owner') { if (!['owner', 'staff'].include
 function login(db, u, pw) {
   const r = db.prepare('SELECT * FROM users WHERE username=?').get(u); if (!r) return null;
   if (!crypto.timingSafeEqual(crypto.scryptSync(pw, r.salt, 32), Buffer.from(r.hash, 'hex'))) return null;
-  const t = crypto.randomBytes(24).toString('hex'); db.prepare('INSERT INTO sessions VALUES(?,?,?)').run(t, r.id, Date.now() + 8 * 3600e3); return t;
+  purgeExpiredSessions(db); const t = crypto.randomBytes(24).toString('hex'); db.prepare('INSERT INTO sessions VALUES(?,?,?)').run(t, r.id, Date.now() + 8 * 3600e3); return t;
 }
+// Ends a session on the server. Unknown or missing tokens are ignored.
+const logout = (db, t) => { if (typeof t === 'string' && t) db.prepare('DELETE FROM sessions WHERE token=?').run(t); };
+// Removes up to `limit` expired sessions per call, so one login never does unbounded work. Called on every login.
+const purgeExpiredSessions = (db, now = Date.now(), limit = 200) => Number(db.prepare('DELETE FROM sessions WHERE token IN (SELECT token FROM sessions WHERE expires<=? LIMIT ?)').run(now, limit).changes);
 const sessionUser = (db, t) => t ? db.prepare('SELECT u.id,u.username,u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires>?').get(t, Date.now()) || null : null;
 // ---- password change and audit log ----
 function audit(db, username, action, detail = '') { db.prepare('INSERT INTO audit(at,username,action,detail) VALUES(?,?,?,?)').run(new Date().toISOString(), String(username).slice(0, 40), action, String(detail).slice(0, 200)); }
@@ -189,4 +205,4 @@ function saveBusiness(db, v) {
   const email = str(v.business_email, 120); if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new AppError('Invalid business email');
   for (const k of BIZ) db.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(k, str(v[k], lim[k]));
 }
-module.exports = { listUsers, backup, audit, listAudit, changePassword, updateDraft, statement, getBusiness, saveBusiness, setting, todayOf, needsSetup, AppError, open, addClient, createInvoice, getInvoice, listInvoices, send, voidInvoice, recordPayment, dashboard, toCsv, createUser, login, sessionUser, validDay, money };
+module.exports = { logout, purgeExpiredSessions, listUsers, backup, audit, listAudit, changePassword, updateDraft, statement, getBusiness, saveBusiness, setting, todayOf, needsSetup, AppError, open, addClient, createInvoice, getInvoice, listInvoices, send, voidInvoice, recordPayment, dashboard, toCsv, createUser, login, sessionUser, validDay, money };
