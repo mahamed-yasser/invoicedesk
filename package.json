@@ -1,1 +1,11 @@
-{"name":"invoicedesk","version":"1.0.0","description":"Clients, invoices and payments for freelancers and small agencies","scripts":{"start":"node --no-warnings server.js","test":"node --no-warnings --test test/*.test.js"}}
+{
+  "name": "invoicedesk",
+  "version": "1.0.0",
+  "description": "Clients, invoices and payments for freelancers and small agencies",
+  "scripts": {
+    "start": "node --no-warnings server.js",
+    "test": "node --no-warnings --test test/*.test.js",
+    "coverage": "node --no-warnings --test --experimental-test-coverage test/*.test.js",
+    "bench": "node --no-warnings tools/bench.js"
+  }
+}
