@@ -16,7 +16,9 @@ function open(file = ':memory:') {
   CREATE TABLE IF NOT EXISTS payments(id INTEGER PRIMARY KEY, invoice_id INTEGER NOT NULL REFERENCES invoices(id), amount_cents INTEGER NOT NULL CHECK(amount_cents>0), paid_on TEXT NOT NULL, method TEXT);
   CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, salt TEXT NOT NULL, hash TEXT NOT NULL);
-  CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires INTEGER NOT NULL);`);
+  CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires INTEGER NOT NULL);
+  CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, at TEXT NOT NULL, username TEXT NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '');`);
+  if (!db.prepare('PRAGMA table_info(users)').all().some(x => x.name === 'role')) { db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'owner'"); db.exec("UPDATE users SET role='staff' WHERE id<>(SELECT min(id) FROM users)"); } // old versions only ever created one account (the setup one); if a database somehow has more, only the first stays owner
   const tz = process.env.BUSINESS_TZ || 'Africa/Cairo', cur = (process.env.CURRENCY || 'USD').toUpperCase();
   new Intl.DateTimeFormat('en', { timeZone: tz }); new Intl.NumberFormat('en', { style: 'currency', currency: cur }); // throw if invalid
   db.prepare("INSERT OR IGNORE INTO settings VALUES('tz',?)").run(tz); db.prepare("INSERT OR IGNORE INTO settings VALUES('currency',?)").run(cur);
@@ -154,13 +156,30 @@ function toCsv(invs) {
   return ['number,client,issue_date,due_date,status,subtotal,tax,total,paid,balance', ...invs.map(i => [i.number, i.client_name, i.issue_date, i.due_date, i.status, money(i.subtotal), money(i.tax), money(i.total), money(i.paid), money(i.balance)].map(esc).join(','))].join('\n') + '\n';
 }
 // auth
-function createUser(db, u, pw) { if (typeof pw !== 'string' || pw.length < 10) throw new Error('Password must be at least 10 characters'); const salt = crypto.randomBytes(16).toString('hex'); db.prepare('INSERT INTO users(username,salt,hash) VALUES(?,?,?)').run(u, salt, crypto.scryptSync(pw, salt, 32).toString('hex')); }
+function createUser(db, u, pw, role = 'owner') { if (!['owner', 'staff'].includes(role)) throw new Error('Role must be owner or staff'); if (typeof pw !== 'string' || pw.length < 10) throw new Error('Password must be at least 10 characters'); const salt = crypto.randomBytes(16).toString('hex'); db.prepare('INSERT INTO users(username,salt,hash,role) VALUES(?,?,?,?)').run(u, salt, crypto.scryptSync(pw, salt, 32).toString('hex'), role); }
 function login(db, u, pw) {
   const r = db.prepare('SELECT * FROM users WHERE username=?').get(u); if (!r) return null;
   if (!crypto.timingSafeEqual(crypto.scryptSync(pw, r.salt, 32), Buffer.from(r.hash, 'hex'))) return null;
   const t = crypto.randomBytes(24).toString('hex'); db.prepare('INSERT INTO sessions VALUES(?,?,?)').run(t, r.id, Date.now() + 8 * 3600e3); return t;
 }
-const sessionUser = (db, t) => t ? db.prepare('SELECT u.id,u.username FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires>?').get(t, Date.now()) || null : null;
+const sessionUser = (db, t) => t ? db.prepare('SELECT u.id,u.username,u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires>?').get(t, Date.now()) || null : null;
+// ---- password change and audit log ----
+function audit(db, username, action, detail = '') { db.prepare('INSERT INTO audit(at,username,action,detail) VALUES(?,?,?,?)').run(new Date().toISOString(), String(username).slice(0, 40), action, String(detail).slice(0, 200)); }
+const listAudit = (db, limit = 100) => db.prepare('SELECT id,at,username,action,detail FROM audit ORDER BY id DESC LIMIT ?').all(Math.min(Math.max(+limit || 100, 1), 500));
+// Checks the current password, stores the new one, and signs out every other session of that user.
+function changePassword(db, userId, current, next, keepToken) {
+  const r = db.prepare('SELECT * FROM users WHERE id=?').get(userId); if (!r) throw new AppError('User not found', 404);
+  if (typeof current !== 'string' || !crypto.timingSafeEqual(crypto.scryptSync(current, r.salt, 32), Buffer.from(r.hash, 'hex'))) throw new AppError('Current password is wrong', 403);
+  if (typeof next !== 'string' || next.length < 10) throw new AppError('Password must be at least 10 characters');
+  if (next === current) throw new AppError('New password must be different');
+  const salt = crypto.randomBytes(16).toString('hex');
+  db.prepare('UPDATE users SET salt=?, hash=? WHERE id=?').run(salt, crypto.scryptSync(next, salt, 32).toString('hex'), userId);
+  db.prepare('DELETE FROM sessions WHERE user_id=? AND token<>?').run(userId, keepToken || '');
+  audit(db, r.username, 'password_changed');
+}
+const listUsers = db => db.prepare('SELECT id,username,role FROM users ORDER BY id').all();
+// Data backup as JSON. Leaves out users, password hashes and sessions on purpose.
+function backup(db) { const t = n => db.prepare('SELECT * FROM ' + n).all(); return { version: 1, at: new Date().toISOString(), settings: t('settings'), clients: t('clients'), invoices: t('invoices'), items: t('items'), payments: t('payments') }; }
 const needsSetup = db => !db.prepare('SELECT 1 FROM users').get();
 const BIZ = ['business_name', 'business_address', 'business_email', 'business_tax_id'];
 function getBusiness(db) { const o = {}; for (const k of BIZ) { const r = db.prepare('SELECT value FROM settings WHERE key=?').get(k); o[k] = r ? r.value : ''; } return o; }
@@ -170,4 +189,4 @@ function saveBusiness(db, v) {
   const email = str(v.business_email, 120); if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new AppError('Invalid business email');
   for (const k of BIZ) db.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(k, str(v[k], lim[k]));
 }
-module.exports = { updateDraft, statement, getBusiness, saveBusiness, setting, todayOf, needsSetup, AppError, open, addClient, createInvoice, getInvoice, listInvoices, send, voidInvoice, recordPayment, dashboard, toCsv, createUser, login, sessionUser, validDay, money };
+module.exports = { listUsers, backup, audit, listAudit, changePassword, updateDraft, statement, getBusiness, saveBusiness, setting, todayOf, needsSetup, AppError, open, addClient, createInvoice, getInvoice, listInvoices, send, voidInvoice, recordPayment, dashboard, toCsv, createUser, login, sessionUser, validDay, money };
